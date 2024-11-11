@@ -16,11 +16,23 @@ except ImportError:
     print("No se ha detectado un entorno compatible con ESP32. Usando simulación de PIR.")
 
 # Inicialización de Firebase
-cred = credentials.Certificate("D:\\laura-24a17-firebase-adminsdk-jswzg-3e63b04f07.json")
-firebase_admin.initialize_app(cred, {
-    'storageBucket': 'laura-24a17.appspot.com',
-    'databaseURL': 'https://laura-24a17-default-rtdb.firebaseio.com'
-})
+import os
+import base64
+import json
+from firebase_admin import credentials, initialize_app, storage, db
+
+# Inicialización de Firebase con credenciales desde variable de entorno
+firebase_credentials = os.environ.get("FIREBASE_CREDENTIALS")
+if firebase_credentials:
+    cred_dict = json.loads(base64.b64decode(firebase_credentials).decode('utf-8'))
+    cred = credentials.Certificate(cred_dict)
+    initialize_app(cred, {
+        'storageBucket': 'laura-24a17.appspot.com',
+        'databaseURL': 'https://laura-24a17-default-rtdb.firebaseio.com'
+    })
+else:
+    print("Error: Credenciales de Firebase no encontradas en variables de entorno.")
+
 
 # Cargar el modelo YOLO
 model = YOLO("yolov8n.pt")
