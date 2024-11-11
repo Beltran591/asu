@@ -1,38 +1,27 @@
-from tkinter import *
-from PIL import Image, ImageTk
+from flask import Flask, render_template, Response
 import cv2
 from ultralytics import YOLO
 import numpy as np
 import requests
-from datetime import datetime, timedelta
 import firebase_admin
 from firebase_admin import credentials, storage, db
 import os
-import random  # Usado para simular el estado del PIR
-
-try:
-    from machine import Pin  # Para manejar el GPIO en ESP32
-except ImportError:
-    print("No se ha detectado un entorno compatible con ESP32. Usando simulación de PIR.")
+import random
+from datetime import datetime, timedelta
+import json
+import base64
 
 # Inicialización de Firebase
-import os
-import base64
-import json
-from firebase_admin import credentials, initialize_app, storage, db
-
-# Inicialización de Firebase con credenciales desde variable de entorno
 firebase_credentials = os.environ.get("FIREBASE_CREDENTIALS")
 if firebase_credentials:
     cred_dict = json.loads(base64.b64decode(firebase_credentials).decode('utf-8'))
     cred = credentials.Certificate(cred_dict)
-    initialize_app(cred, {
+    firebase_admin.initialize_app(cred, {
         'storageBucket': 'laura-24a17.appspot.com',
         'databaseURL': 'https://laura-24a17-default-rtdb.firebaseio.com'
     })
 else:
     print("Error: Credenciales de Firebase no encontradas en variables de entorno.")
-
 
 # Cargar el modelo YOLO
 model = YOLO("yolov8n.pt")
@@ -42,7 +31,7 @@ with open(classesFile, 'rt') as f:
     COLORS = np.random.uniform(0, 255, size=(len(classes), 3))
 
 # Captura de video
-url = 'http://192.168.137.117/640x480.jpg'
+url = 'http://192.168.137.117/640x480.jpg'  # IP de tu ESP32-CAM
 cap = cv2.VideoCapture(url)
 
 # Configuración de Telegram
@@ -127,40 +116,23 @@ def draw_box(frame, box, label, color):
     cv2.rectangle(frame, (x1, y1 - label_size[1]), (x1 + label_size[0], y1 + base_line), color, cv2.FILLED)
     cv2.putText(frame, label, (x1, y1), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
-def on_closing():
-    root.quit()
-    cap.release()
-    root.destroy()
+# Flask application
+app = Flask(__name__)
 
-def update_dashboard():
-    for widget in dashboard_frame.winfo_children():
-        widget.destroy()
-    for photo_data in photos_data:
-        img_label = Label(dashboard_frame)
-        img = Image.open(photo_data['url_foto'])
-        img.thumbnail((100, 100))
-        tk_image = ImageTk.PhotoImage(img)
-        img_label.configure(image=tk_image)
-        img_label.image = tk_image
-        img_label.grid(row=len(photos_data), column=0, padx=5, pady=5)
-        info_label = Label(dashboard_frame, text=photo_data['fecha_hora'])
-        info_label.grid(row=len(photos_data) - 1, column=1, padx=5, pady=5)
-
-def callback():
+def generate_frames():
     global detection_start_time, last_movement_time
-    cap.open(url)
-    ret, frame = cap.read()
-    if ret:
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
         movement_detected = detect_motion()
         if movement_detected:
             last_movement_time = datetime.now()
-            # Enviar alerta de movimiento detectado a Firebase y Telegram
             ref = db.reference('movimientos')
             ref.push({
                 'movimiento': 'Movimiento detectado',
                 'fecha_hora': last_movement_time.strftime('%Y-%m-%d %H:%M:%S')
             })
-            print("Movimiento detectado guardado en Firebase.")
             send_alert_to_telegram("Movimiento detectado", CHAT_ID, BOT_TOKEN)
         results = model.predict(frame, stream=True, verbose=False)
         person_detected = False
@@ -173,14 +145,9 @@ def callback():
                     person_detected = True
                     if detection_start_time is None:
                         detection_start_time = datetime.now()
-                    print("¡Persona detectada!")
                 color = tuple(COLORS[int(c)])
                 draw_box(frame, r, label=classes[int(c)], color=color)
-        img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        img = Image.fromarray(img)
-        tkimage = ImageTk.PhotoImage(img)
-        label.configure(image=tkimage)
-        label.image = tkimage
+
         if person_detected:
             now = datetime.now()
             if detection_start_time and (now - detection_start_time).total_seconds() > 5:
@@ -189,34 +156,23 @@ def callback():
                 cv2.imwrite(photo_path, frame)
                 photo_url = upload_photo_to_firebase(photo_path)
                 save_photo_data_to_firebase(photo_url, timestamp)
-                photos_data.append({'url_foto': photo_path, 'fecha_hora': timestamp})
-                update_dashboard()
                 send_photo_to_telegram(photo_path, CHAT_ID, BOT_TOKEN)
                 detection_start_time = None
         else:
             detection_start_time = None
-        if datetime.now() - last_movement_time > timedelta(seconds=10):
-            ref = db.reference('alertas')
-            ref.push({
-                'alerta': 'No se detecta movimiento',
-                'fecha_hora': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            })
-            send_alert_to_telegram("No se detecta movimiento en los últimos 10 segundos", CHAT_ID, BOT_TOKEN)
-            print("Alerta de ausencia de movimiento enviada a Firebase.")
-        root.after(1, callback)
-    else:
-        on_closing()
+        _, jpeg = cv2.imencode('.jpg', frame)
+        frame_jpeg = jpeg.tobytes()
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + frame_jpeg + b'\r\n\r\n')
 
-root = Tk()
-root.protocol("WM_DELETE_WINDOW", on_closing)
-root.title("Vision Artificial")
+@app.route('/')
+def index():
+    return render_template('index.html')
 
-label = Label(root)
-label.grid(row=1, padx=20, pady=20)
+@app.route('/video_feed')
+def video_feed():
+    return Response(generate_frames(),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
 
-dashboard_frame = Frame(root)
-dashboard_frame.grid(row=2, padx=20, pady=20)
-
-root.after(1, callback)
-root.mainloop()
-
+if __name__ == '__main__':
+    app.run(debug=True, host='0.0.0.0', port=5000)
