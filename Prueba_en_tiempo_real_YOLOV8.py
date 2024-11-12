@@ -7,21 +7,23 @@ import firebase_admin
 from firebase_admin import credentials, storage, db
 import os
 import random
-from datetime import datetime, timedelta
+from datetime import datetime
 import json
 import base64
 
-# Inicialización de Firebase
-firebase_credentials = os.environ.get("FIREBASE_CREDENTIALS")
-if firebase_credentials:
-    cred_dict = json.loads(base64.b64decode(firebase_credentials).decode('utf-8'))
-    cred = credentials.Certificate(cred_dict)
+# Inicialización de Firebase usando credenciales en base64 desde una variable de entorno
+firebase_credentials_b64 = os.getenv('FIREBASE_CREDENTIALS')
+if firebase_credentials_b64:
+    # Decodifica las credenciales y carga el certificado desde la cadena base64
+    firebase_credentials = json.loads(base64.b64decode(firebase_credentials_b64))
+    cred = credentials.Certificate(firebase_credentials)
     firebase_admin.initialize_app(cred, {
         'storageBucket': 'laura-24a17.appspot.com',
         'databaseURL': 'https://laura-24a17-default-rtdb.firebaseio.com'
     })
+    print("Firebase inicializado correctamente.")
 else:
-    print("Error: Credenciales de Firebase no encontradas en variables de entorno.")
+    print("Error: Credenciales de Firebase no encontradas en las variables de entorno.")
 
 # Cargar el modelo YOLO
 model = YOLO("yolov8n.pt")
@@ -30,28 +32,21 @@ with open(classesFile, 'rt') as f:
     classes = f.read().rstrip('\n').split('\n')
     COLORS = np.random.uniform(0, 255, size=(len(classes), 3))
 
-# Captura de video
-url = 'http://192.168.137.117/640x480.jpg'  # IP de tu ESP32-CAM
-cap = cv2.VideoCapture(url)
+# Configuración de la URL de la ESP32-CAM
+url = 'http://192.168.137.117/640x480.jpg'  # IP de tu ESP32-CAM (asegúrate de que sea accesible desde la nube)
 
 # Configuración de Telegram
-CHAT_ID = '6452057967'
-BOT_TOKEN = '7240445682:AAFxrSGBk1uhT37_KNC8w28TZGMW8kxZqf8'
+CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')  # ID del chat de Telegram desde variable de entorno
+BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')  # Token del bot de Telegram desde variable de entorno
 
 detection_start_time = None
 last_movement_time = datetime.now()
-photos_data = []
 
-# Configuración del pin del sensor PIR
-try:
-    PIR_PIN = Pin(13, Pin.IN)  # Configurar el pin GPIO 13 como entrada
-    def detect_motion():
-        return PIR_PIN.value()
-except NameError:
-    print("Usando simulación de sensor PIR.")
-    def detect_motion():
-        return random.choice([0, 1])  # Simula movimiento aleatorio
+# Simulación de sensor PIR
+def detect_motion():
+    return random.choice([0, 1])  # Simula movimiento aleatorio
 
+# Función para subir fotos a Firebase
 def upload_photo_to_firebase(photo_path):
     if not os.path.exists(photo_path):
         print(f"Error: No se encontró el archivo {photo_path}")
@@ -122,9 +117,21 @@ app = Flask(__name__)
 def generate_frames():
     global detection_start_time, last_movement_time
     while True:
-        ret, frame = cap.read()
-        if not ret:
+        # Captura una imagen desde el ESP32-CAM
+        try:
+            # Obtiene la imagen de la cámara ESP32-CAM
+            resp = requests.get(url)
+            if resp.status_code != 200:
+                print("Error al conectar con la cámara.")
+                break
+            # Convierte la imagen en un formato legible por OpenCV
+            frame = np.array(bytearray(resp.content), dtype=np.uint8)
+            frame = cv2.imdecode(frame, -1)
+        except Exception as e:
+            print(f"Error al capturar imagen: {e}")
             break
+
+        # Simulación del sensor PIR
         movement_detected = detect_motion()
         if movement_detected:
             last_movement_time = datetime.now()
@@ -134,6 +141,8 @@ def generate_frames():
                 'fecha_hora': last_movement_time.strftime('%Y-%m-%d %H:%M:%S')
             })
             send_alert_to_telegram("Movimiento detectado", CHAT_ID, BOT_TOKEN)
+
+        # Detección de objetos
         results = model.predict(frame, stream=True, verbose=False)
         person_detected = False
         for result in results:
@@ -148,11 +157,12 @@ def generate_frames():
                 color = tuple(COLORS[int(c)])
                 draw_box(frame, r, label=classes[int(c)], color=color)
 
+        # Almacenar y enviar notificaciones si se detecta una persona
         if person_detected:
             now = datetime.now()
             if detection_start_time and (now - detection_start_time).total_seconds() > 5:
                 timestamp = now.strftime('%Y%m%d_%H%M%S')
-                photo_path = f'captura_foto_{timestamp}.jpg'
+                photo_path = f'/tmp/captura_foto_{timestamp}.jpg'
                 cv2.imwrite(photo_path, frame)
                 photo_url = upload_photo_to_firebase(photo_path)
                 save_photo_data_to_firebase(photo_url, timestamp)
@@ -160,6 +170,8 @@ def generate_frames():
                 detection_start_time = None
         else:
             detection_start_time = None
+
+        # Codifica el fotograma en JPEG para enviarlo al navegador
         _, jpeg = cv2.imencode('.jpg', frame)
         frame_jpeg = jpeg.tobytes()
         yield (b'--frame\r\n'
@@ -175,7 +187,6 @@ def video_feed():
                     mimetype='multipart/x-mixed-replace; boundary=frame')
 
 if __name__ == '__main__':
-    import os
-    port = int(os.environ.get("PORT", 5000))  # Usa el puerto 5000 si no se especifica otro
+    port = int(os.environ.get("PORT", 5000))  # Usa el puerto 5000 o el puerto proporcionado por Render
     app.run(debug=True, host='0.0.0.0', port=port)
 
