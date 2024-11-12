@@ -10,6 +10,7 @@ import random
 from datetime import datetime
 import json
 import base64
+import time
 
 # Inicialización de Firebase usando credenciales en base64 desde una variable de entorno
 firebase_credentials_b64 = os.getenv('FIREBASE_CREDENTIALS')
@@ -113,23 +114,24 @@ def draw_box(frame, box, label, color):
 
 # Flask application
 app = Flask(__name__)
+frame_counter = 0  # Contador de cuadros
 
 def generate_frames():
-    global detection_start_time, last_movement_time
+    global detection_start_time, last_movement_time, frame_counter
     while True:
-        # Captura una imagen desde el ESP32-CAM
         try:
-            # Obtiene la imagen de la cámara ESP32-CAM
-            resp = requests.get(url)
+            # Intenta obtener la imagen con un timeout
+            resp = requests.get(url, timeout=5)
             if resp.status_code != 200:
-                print("Error al conectar con la cámara.")
-                break
-            # Convierte la imagen en un formato legible por OpenCV
+                print("Error al conectar con la cámara. Reintentando...")
+                time.sleep(1)
+                continue
             frame = np.array(bytearray(resp.content), dtype=np.uint8)
             frame = cv2.imdecode(frame, -1)
-        except Exception as e:
-            print(f"Error al capturar imagen: {e}")
-            break
+        except requests.exceptions.RequestException as e:
+            print(f"Error de conexión: {e}. Reintentando en 1 segundo...")
+            time.sleep(1)
+            continue
 
         # Simulación del sensor PIR
         movement_detected = detect_motion()
@@ -142,34 +144,37 @@ def generate_frames():
             })
             send_alert_to_telegram("Movimiento detectado", CHAT_ID, BOT_TOKEN)
 
-        # Detección de objetos
-        results = model.predict(frame, stream=True, verbose=False)
-        person_detected = False
-        for result in results:
-            boxes = result.boxes
-            for box in boxes:
-                r = box.xyxy[0]
-                c = box.cls
-                if classes[int(c)] == "persona":
-                    person_detected = True
-                    if detection_start_time is None:
-                        detection_start_time = datetime.now()
-                color = tuple(COLORS[int(c)])
-                draw_box(frame, r, label=classes[int(c)], color=color)
+        # Realiza detección solo cada 10 cuadros
+        if frame_counter % 10 == 0:
+            results = model.predict(frame, stream=True, verbose=False)
+            person_detected = False
+            for result in results:
+                boxes = result.boxes
+                for box in boxes:
+                    r = box.xyxy[0]
+                    c = box.cls
+                    if classes[int(c)] == "persona":
+                        person_detected = True
+                        if detection_start_time is None:
+                            detection_start_time = datetime.now()
+                    color = tuple(COLORS[int(c)])
+                    draw_box(frame, r, label=classes[int(c)], color=color)
 
-        # Almacenar y enviar notificaciones si se detecta una persona
-        if person_detected:
-            now = datetime.now()
-            if detection_start_time and (now - detection_start_time).total_seconds() > 5:
-                timestamp = now.strftime('%Y%m%d_%H%M%S')
-                photo_path = f'/tmp/captura_foto_{timestamp}.jpg'
-                cv2.imwrite(photo_path, frame)
-                photo_url = upload_photo_to_firebase(photo_path)
-                save_photo_data_to_firebase(photo_url, timestamp)
-                send_photo_to_telegram(photo_path, CHAT_ID, BOT_TOKEN)
+            # Almacenar y enviar notificaciones si se detecta una persona
+            if person_detected:
+                now = datetime.now()
+                if detection_start_time and (now - detection_start_time).total_seconds() > 5:
+                    timestamp = now.strftime('%Y%m%d_%H%M%S')
+                    photo_path = f'/tmp/captura_foto_{timestamp}.jpg'
+                    cv2.imwrite(photo_path, frame)
+                    photo_url = upload_photo_to_firebase(photo_path)
+                    save_photo_data_to_firebase(photo_url, timestamp)
+                    send_photo_to_telegram(photo_path, CHAT_ID, BOT_TOKEN)
+                    detection_start_time = None
+            else:
                 detection_start_time = None
-        else:
-            detection_start_time = None
+
+        frame_counter += 1
 
         # Codifica el fotograma en JPEG para enviarlo al navegador
         _, jpeg = cv2.imencode('.jpg', frame)
@@ -189,4 +194,3 @@ def video_feed():
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))  # Usa el puerto 5000 o el puerto proporcionado por Render
     app.run(debug=True, host='0.0.0.0', port=port)
-
