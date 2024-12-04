@@ -1,4 +1,3 @@
-
 #include "WifiCam.hpp"
 #include <WiFi.h>
 
